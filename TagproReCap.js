@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         TagPro ReCap - Cap Reel
+// @name         TagPro Cap Reel
 // @namespace    https://tagpro.koalabeast.com/
-// @version      1.0.1
-// @description  In a replay: one click records every capture (whole run, camera on the capper) as a 1080p60 video, rendered by the game itself with your texture pack. Can also build a "caps only" replay file for the Upload tab.
+// @version      1.0.8
+// @description  In a replay: one click records every capture (whole run, camera on the capper) as a 1080p60 video, rendered by the game itself with your texture pack. Can also build a "caps only" replay file for the Upload tab, and loop it while it plays.
 // @author       Claude Fable 5.1, gryff6
 // @match        https://tagpro.koalabeast.com/game*
 // @match        https://tagpro.gg/game*
@@ -25,8 +25,13 @@
         banners: true,     // "CAP n" card during the lead-in + CAPTURE banner after the cap
         fades: true,       // short fade to black between clips
         bg: '#000000',     // colour behind the map (the canvas is transparent)
+        webm: false,       // record WebM (VP9) instead of MP4 (H.264)
+        lockView: true,    // while watching a caps-only replay: keep the camera on the capper and the view at `zoom`
+        loop: true,        // while watching a caps-only replay: start over when it reaches the end
+        loopDelay: 1,      // seconds the last frame stays on screen before it starts over
         width: 1920, height: 1080, fps: 60, bitrate: 14e6,
     };
+    const VERSION = '1.0.8';
     const LS_KEY = 'tpCapReel';
     const CFG = Object.assign({}, DEFAULTS, safeParse(localStorage.getItem(LS_KEY)));
     function safeParse(s) { try { return JSON.parse(s) || {}; } catch (e) { return {}; } }
@@ -36,7 +41,19 @@
 
     // ------------------------------------------------------------------ helpers
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-    const frames = (n) => new Promise((r) => { const f = () => (--n <= 0 ? r() : requestAnimationFrame(f)); requestAnimationFrame(f); });
+    const frames = (n) => new Promise((r) => {
+        let done = false;
+        const f = () => { if (done) return; if (--n <= 0) { done = true; r(); } else requestAnimationFrame(f); };
+        requestAnimationFrame(f);
+        setTimeout(() => { if (!done) { done = true; r(); } }, 300 * n + 500);   // never hang if the tab stops painting
+    });
+    const diag = [];
+    const log = (...a) => {
+        const line = a.map((x) => (typeof x === 'string' ? x : (x && x.message) || JSON.stringify(x))).join(' ');
+        diag.push(new Date().toISOString().slice(11, 19) + ' ' + line);
+        if (diag.length > 400) diag.shift();
+        console.log('[CapReel]', ...a);
+    };
     function waitFor(fn, timeout = 60000) {
         return new Promise((resolve, reject) => {
             const t0 = Date.now();
@@ -100,7 +117,7 @@
         if (a && a.length) a.first().trigger('click'); else tagpro.replayPlayer.speed(1);
         tagpro.replaySpeed = 1;
     }
-    function seekPaused(t) {
+    function seekTo(t, keepPlaying) {
         const rd = tagpro.replayData;
         t = Math.min(Math.max(t, rd.minTS || 0), rd.maxTSSeek || rd.maxTS || t);
         const bar = $ && $('#replaySeekBar');
@@ -118,20 +135,100 @@
             setTimeout(() => { tagpro.renderer.options.disableCapAnimations = false; tagpro.renderer.options.disableAllExplosions = false; }, 0);
             tagpro.replayPlayer.play(); tagpro.replayPaused = false;
         }
+        // the seek itself (re)plays the first 'time' packet, so a replay that had ended is ACTIVE again here
         pauseUI();
+        if (keepPlaying) playUI();
     }
+    const seekPaused = (t) => seekTo(t, false);
+    const atEnd = () => { const p = player(); return !!p && !p.packets[p.currentIndex]; };
     function follow(pid) {
-        const vp = tagpro.viewport;
-        vp.overview = false; vp.centerLock = false; vp.followPlayer = true;
-        if (typeof tagpro.replayFollowPlayer === 'function') tagpro.replayFollowPlayer(pid);   // same as clicking a name in the player list
-        else tagpro.replayPlayer.emit('id', pid);
-        tagpro.playerId = pid;
-        vp.pan = false; vp.panning = false; vp.newTarget = false;   // skip the 750 ms pan animation
-        tagpro.zoom = CFG.zoom; tagpro.renderer.forceZoomUpdate = true;
+        state.followPid = pid;
+        try {
+            if (typeof tagpro.replayFollowPlayer === 'function') tagpro.replayFollowPlayer(pid);   // same as clicking a name in the player list
+            else tagpro.replayPlayer.emit('id', pid);
+        } catch (e) { log('replayFollowPlayer failed, forcing playerId', e); }
+        enforceCamera();
+    }
+    // The game itself fights the camera while a replay seeks (its arrivedInGame handler puts
+    // the viewer back into the map overview and resets the zoom, and an id event starts a
+    // 750 ms pan), so while a clip records the camera state is re-applied every frame.
+    function enforceCamera() {
+        const r = tagpro.renderer;
+        r.forceZoomUpdate = true;                    // re-apply container scale from the locked zoom/scale
+        if (CFG.hideHud && r.layers.ui.visible) r.layers.ui.visible = false;
     }
 
     // ------------------------------------------------------------------ record mode (canvas size, HUD)
+    // Other userscripts on the replay page (e.g. Viewport Expander, which polls every 500 ms and
+    // re-sizes the canvas / re-fits the zoom) and the game itself keep writing the properties the
+    // recorder depends on. Instead of racing them, record mode turns those properties into locked
+    // accessors: reads return the recorder's value, writes are remembered and applied when the
+    // lock is lifted.
     let saved = null;
+    const locks = [];
+    function lockProp(obj, prop, value) {
+        const desc = Object.getOwnPropertyDescriptor(obj, prop);
+        let store = obj[prop];
+        Object.defineProperty(obj, prop, {
+            configurable: true, enumerable: true,
+            get() { return (typeof value === 'function') ? value(store) : value; },
+            set(v) { store = v; },
+        });
+        locks.push(() => { delete obj[prop]; if (desc && (desc.get || desc.set)) Object.defineProperty(obj, prop, desc); else obj[prop] = store; });
+    }
+    function unlockAll() { while (locks.length) { try { locks.pop()(); } catch (e) { /* ignore */ } } }
+    // Caps-only playback: the file switches the followed player itself (id packets), but other
+    // scripts (Viewport Expander's 500 ms auto-fit) and the game's overview reset keep changing
+    // the view. Optional locks keep the camera following and the zoom at the panel's View value.
+    let viewLocked = false;
+    function enterViewMode() {
+        if (viewLocked) return;
+        viewLocked = true;
+        const on = () => CFG.lockView;
+        const vp = tagpro.viewport;
+        Object.defineProperty(tagpro, 'zoom', { configurable: true, enumerable: true, get() { return on() ? CFG.zoom : (this.__zoomStore == null ? CFG.zoom : this.__zoomStore); }, set(v) { this.__zoomStore = v; } });
+        const flag = (prop, val) => { let store = vp[prop]; Object.defineProperty(vp, prop, { configurable: true, enumerable: true, get() { return on() ? val : store; }, set(v) { store = v; } }); };
+        flag('overview', false); flag('centerLock', false); flag('followPlayer', true);
+        tagpro.renderer.forceZoomUpdate = true;
+        log('view mode: camera follows the capper, view ' + CFG.zoom + ' (lock ' + (CFG.lockView ? 'on' : 'off') + ')');
+    }
+    // Caps-only playback: play the reel again when it reaches the end. When the replay player runs
+    // out of packets it calls its doneCallback, and the replay bar turns that into "replayEnd":
+    // state ENDED, seek bar and controls disabled, nothing can ever play again. Taking over that
+    // callback keeps the viewer alive; the reel is then restarted through the bar's own seek.
+    let loopTimer = null;
+    function installLoop() {
+        const p = player();
+        if (!p || p.__capReelLoop) return;
+        p.__capReelLoop = true;
+        const origDone = p.doneCallback;
+        p.doneCallback = () => {
+            if (state.restarting) return;                          // the restart itself calls play() once while still at the end
+            if (!CFG.loop || state.recording) { if (origDone) origDone(); return; }
+            state.restarting = true;
+            state.loops = (state.loops || 0) + 1;
+            log(`reel finished at ${(p.currentTime / 1000).toFixed(1)} s — playing it again in ${CFG.loopDelay} s (loop ${state.loops})`);
+            try { pauseUI(); } catch (e) { /* ignore */ }          // hold the last frame; the player is already paused
+            setStatus(`Reel finished — starts again in ${CFG.loopDelay} s`);
+            clearTimeout(loopTimer);
+            loopTimer = setTimeout(restartReel, Math.max(0, (+CFG.loopDelay || 0) * 1000));
+        };
+        log('loop: ' + (CFG.loop ? 'on, ' + CFG.loopDelay + ' s hold' : 'off'));
+    }
+    function restartReel() {
+        clearTimeout(loopTimer);
+        if (state.recording) { state.restarting = false; return; }
+        state.restarting = true;
+        try {
+            seekTo(tagpro.replayData.minTS || 0, true);
+            enforceCamera();
+            if (CFG.hideHud) tagpro.renderer.layers.ui.visible = false;
+            setStatus(`Caps-only replay: playing again (loop ${state.loops || 0})`);
+            log(`restarted: replay time ${(nowMs() / 1000).toFixed(2)} s, following ${tagpro.playerId} (${playerInfo(tagpro.playerId).name}), state ${tagpro.state}, paused ${tagpro.replayPaused}`);
+        } catch (e) { log('restart failed', e); setStatus('Could not restart the reel: ' + (e && e.message)); }
+        state.restarting = false;
+    }
+    const clipActive = () => state.recording && !state.transition && !!state.followPid;
     function fitCss() {
         const c = tagpro.renderer.canvas, W = CFG.width, H = CFG.height;
         const ww = window.innerWidth, wh = window.innerHeight;
@@ -142,18 +239,18 @@
     function enterRecordMode() {
         const r = tagpro.renderer;
         if (saved) return;
+        const worldW = 1280, worldH = Math.round(1280 * CFG.height / CFG.width);   // 1280x720 world px -> 1920x1080 (1.5x)
         saved = {
             cw: r.canvas_width, ch: r.canvas_height, resizeView: r.resizeView, centerView: r.centerView,
             dvs: r.options.disableViewportScaling, ui: r.layers.ui.visible, zoom: tagpro.zoom,
             vp: Object.assign({}, tagpro.viewport), playerId: tagpro.playerId, style: r.canvas.getAttribute('style') || '',
         };
-        r.canvas_width = 1280; r.canvas_height = Math.round(1280 * CFG.height / CFG.width);   // 1280x720 world px -> 1920x1080 (1.5x)
         r.options.disableViewportScaling = false;
         r.resizeView = function () {
-            if (!r.renderer) return;
-            r.originalWidth = r.canvas_width; r.originalHeight = r.canvas_height;
+            const pr = r.renderer; if (!pr) return;
+            r.originalWidth = worldW; r.originalHeight = worldH;
             r.adjustedWidth = CFG.width; r.adjustedHeight = CFG.height;
-            r.renderer.resize(CFG.width, CFG.height);
+            if (!pr.view || pr.view.width !== CFG.width || pr.view.height !== CFG.height) pr.resize(CFG.width, CFG.height);   // resizing to the same size would still clear the canvas
             fitCss();
         };
         r.centerView = function () {
@@ -162,28 +259,48 @@
             r.vpWidth = CFG.width; r.vpHeight = CFG.height;
             if (tagpro.chat && tagpro.chat.resize) tagpro.chat.resize();
         };
+        // locked while recording
+        lockProp(r, 'canvas_width', worldW);
+        lockProp(r, 'canvas_height', worldH);
+        lockProp(r, 'resizeScaleFactor', CFG.height / worldH);
+        lockProp(tagpro, 'zoom', () => CFG.zoom);
+        lockProp(tagpro, 'zooming', 0);
+        const vp = tagpro.viewport;
+        lockProp(vp, 'overview', (s) => (clipActive() ? false : s));
+        lockProp(vp, 'centerLock', (s) => (clipActive() ? false : s));
+        lockProp(vp, 'followPlayer', (s) => (clipActive() ? true : s));
+        lockProp(vp, 'pan', (s) => (clipActive() ? false : s));
+        lockProp(vp, 'panning', (s) => (clipActive() ? false : s));
+        lockProp(vp, 'newTarget', (s) => (clipActive() ? false : s));
+        lockProp(tagpro, 'playerId', (s) => (clipActive() && tagpro.players[state.followPid] ? state.followPid : s));
         r.resizeAndCenterView();
         r.forceZoomUpdate = true;
         if (CFG.hideHud) r.layers.ui.visible = false;
+        log('record mode on: canvas ' + r.renderer.view.width + 'x' + r.renderer.view.height + ', world ' + worldW + 'x' + worldH + ', scale ' + r.resizeScaleFactor + ', zoom ' + tagpro.zoom);
     }
     function exitRecordMode() {
         const r = tagpro.renderer;
         if (!saved) return;
+        unlockAll();
         r.canvas_width = saved.cw; r.canvas_height = saved.ch;
         r.resizeView = saved.resizeView; r.centerView = saved.centerView;
         r.options.disableViewportScaling = saved.dvs;
         r.layers.ui.visible = saved.ui;
         r.canvas.setAttribute('style', saved.style);
-        r.resizeAndCenterView();
-        tagpro.zoom = saved.zoom; r.forceZoomUpdate = true;
+        tagpro.zoom = saved.zoom; tagpro.zooming = 0;
         Object.assign(tagpro.viewport, saved.vp);
+        tagpro.playerId = saved.playerId;
+        try { r.resizeAndCenterView(); } catch (e) { log('resizeAndCenterView on exit failed', e); }
+        r.forceZoomUpdate = true;
         saved = null;
     }
 
     // ------------------------------------------------------------------ compositor + overlays
     const rec = document.createElement('canvas');
+    Object.assign(rec.style, { position: 'fixed', left: '-10000px', top: '0', width: '1px', height: '1px', opacity: '0', pointerEvents: 'none' });
+    (document.body || document.documentElement).appendChild(rec);
     const ctx = rec.getContext('2d');
-    const state = { recording: false, abort: false, cap: null, clip: null, caps: [], status: '' };
+    const state = { recording: false, transition: false, abort: false, cap: null, clip: null, caps: [], status: '', followPid: null, framesTotal: 0, framesClip: 0, lastFrameAt: 0, pausedHidden: false, restarting: false, loops: 0 };
     function roundRect(x, y, w, h, r) { ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); }
     const FONT = '"Poppins", "Helvetica Neue", Helvetica, Arial, sans-serif';
     function drawOverlay(t) {
@@ -246,18 +363,42 @@
     }
     function composite() {
         if (!state.recording) return;
+        state.lastFrameAt = performance.now();
+        if (state.pausedHidden) {                          // window is back: continue the clip
+            state.pausedHidden = false;
+            try { playUI(); } catch (e) { /* ignore */ }
+            setStatus(state.cap ? `Cap ${state.cap.index}/${state.caps.length} — ${state.cap.name} … recording` : 'Recording…');
+            log('window visible again, resuming');
+        }
         ctx.globalAlpha = 1;
+        ctx.fillStyle = '#000'; ctx.fillRect(0, 0, rec.width, rec.height);
+        state.framesTotal++;
+        if (state.transition) return;                       // between clips: plain black frames
+        state.framesClip++;
         ctx.fillStyle = CFG.bg; ctx.fillRect(0, 0, rec.width, rec.height);
         try { ctx.drawImage(tagpro.renderer.canvas, 0, 0, rec.width, rec.height); } catch (e) { /* ignore */ }
         drawOverlay(nowMs());
     }
-    let renderHooked = false;
-    function hookRender() {
-        if (renderHooked) return;
-        const r = tagpro.renderer;
-        const orig = r.render;
-        r.render = function () { orig.call(r); composite(); };
-        renderHooked = true;
+    // Frames are grabbed right after PIXI has drawn the stage (same task, so the WebGL buffer is
+    // still intact). The hook lives on the PIXI renderer instance; a guard loop re-installs it if
+    // the instance is ever replaced while recording.
+    let hookedRenderer = null;
+    function hookPixiRender() {
+        const r = tagpro.renderer, pr = r && r.renderer;
+        if (!pr || hookedRenderer === pr) return;
+        const orig = pr.render;
+        pr.render = function (target, options) {
+            const res = orig.call(this, target, options);
+            if (state.recording && target === tagpro.renderer.stage && !(options && options.renderTexture)) composite();
+            return res;
+        };
+        hookedRenderer = pr;
+        log('frame hook installed on the PIXI renderer');
+    }
+    function guardLoop() {
+        if (!state.recording) return;
+        try { hookPixiRender(); if (clipActive()) enforceCamera(); } catch (e) { /* ignore */ }
+        requestAnimationFrame(guardLoop);
     }
 
     // ------------------------------------------------------------------ recording
@@ -265,58 +406,116 @@
         const list = ['video/mp4;codecs=avc1.640028', 'video/mp4;codecs=avc1.42E01E', 'video/mp4', 'video/webm;codecs=h264', 'video/webm;codecs=vp9', 'video/webm'];
         return list.find((m) => window.MediaRecorder && MediaRecorder.isTypeSupported(m)) || '';
     }
+    function onVisibility() {
+        if (document.hidden && state.recording && clipActive() && !state.pausedHidden) {
+            state.pausedHidden = true;
+            try { pauseUI(); } catch (e) { /* ignore */ }
+            setStatus('Paused — bring this window to the front to keep recording');
+            log('tab hidden, pausing the clip');
+        }
+    }
+    function mimeCandidates() {
+        const mp4 = ['video/mp4;codecs=avc1.640028', 'video/mp4;codecs=avc1.42E01E', 'video/mp4'];
+        const webm = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'];
+        return (CFG.webm ? webm.concat(mp4) : mp4.concat(webm)).filter((m) => window.MediaRecorder && MediaRecorder.isTypeSupported(m));
+    }
     async function recordReel(caps) {
         if (state.recording) return;
-        const mime = pickMime();
-        if (!mime) { setStatus('This browser cannot record video (MediaRecorder unavailable).'); return; }
-        state.recording = true; state.abort = false; state.caps = caps;
+        if (!mimeCandidates().length) { setStatus('This browser cannot record video (MediaRecorder unavailable).'); return; }
+        state.recording = true; state.transition = true; state.abort = false; state.caps = caps; state.followPid = null;
+        state.framesTotal = 0; state.framesClip = 0;
+        clearTimeout(loopTimer); state.restarting = false;   // the recorder drives the seeks itself
         rec.width = CFG.width; rec.height = CFG.height;
-        enterRecordMode();
-        hookRender();
-        setSpeed1();
-        const stream = rec.captureStream(CFG.fps);
         const chunks = [];
-        const recorder = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: CFG.bitrate });
-        recorder.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
-        const stopped = new Promise((r) => { recorder.onstop = r; });
-        let started = false;
+        const clipReport = [];
+        let recorder = null, mime = '', stopped = null, started = false;
+        const tRec0 = performance.now();
         try {
+            enterRecordMode();
+            hookPixiRender();
+            requestAnimationFrame(guardLoop);
+            setSpeed1();
+            const stream = rec.captureStream(CFG.fps);
+            for (const m of mimeCandidates()) {
+                try { recorder = new MediaRecorder(stream, { mimeType: m, videoBitsPerSecond: CFG.bitrate }); mime = m; break; }
+                catch (e) { log('MediaRecorder rejected ' + m + ': ' + e.message); }
+            }
+            if (!recorder) throw new Error('no usable video format for MediaRecorder');
+            recorder.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+            recorder.onerror = (e) => log('recorder error', e.error || e);
+            stopped = new Promise((r) => { recorder.onstop = r; });
+            log('recording ' + caps.length + ' caps as ' + mime + ' at ' + CFG.width + 'x' + CFG.height + ', pre ' + CFG.pre + 's, post ' + CFG.post + 's, mode ' + CFG.mode);
+            // One continuous recording; the seeks between clips are covered by black frames.
+            recorder.start(1000); started = true;
+            state.lastFrameAt = performance.now(); state.pausedHidden = false;
+            document.addEventListener('visibilitychange', onVisibility);
+            // warm-up: make sure frames are actually flowing into the encoder before the first clip
+            const warm0 = performance.now();
+            while (chunks.length < 2 && performance.now() - warm0 < 6000) await frames(6);
+            log('warm-up done: ' + chunks.length + ' chunks, ' + state.framesTotal + ' frames in ' + ((performance.now() - warm0) / 1000).toFixed(1) + 's');
+            if (!state.framesTotal) throw new Error('no frames are being drawn — is the tab visible?');
             for (const cap of caps) {
                 if (state.abort) break;
                 const clip = clipWindow(cap);
-                state.cap = cap; state.clip = clip;
-                setStatus(`Cap ${cap.index}/${caps.length} — ${cap.name} … keep this tab visible`);
+                state.transition = true; state.cap = cap; state.clip = clip;
+                setStatus(`Cap ${cap.index}/${caps.length} — ${cap.name} … recording (keep this window in front)`);
+                log(`cap ${cap.index}: ${cap.name} (pid ${cap.pid}) window ${(clip.t0 / 1000).toFixed(1)}s → ${(clip.t1 / 1000).toFixed(1)}s`);
                 seekPaused(clip.t0);
                 follow(cap.pid);
                 await frames(4);
-                if (!started) { recorder.start(1000); started = true; } else { recorder.resume(); }
-                await frames(1);
+                state.framesClip = 0;
+                state.transition = false;
+                log(`  after seek: replay time ${(nowMs() / 1000).toFixed(2)}s, following ${tagpro.playerId} (${(tagpro.players[tagpro.playerId] || {}).name}), zoom ${tagpro.zoom}, scale ${tagpro.renderer.resizeScaleFactor}, paused ${tagpro.replayPaused}, chunks ${chunks.length}`);
                 playUI();
+                const tStart = performance.now();
                 await new Promise((resolve) => {
-                    const tick = () => { if (state.abort || nowMs() >= clip.t1 || !player().packets[player().currentIndex]) resolve(); else requestAnimationFrame(tick); };
-                    requestAnimationFrame(tick);
+                    const tick = () => {
+                        if (state.abort || nowMs() >= clip.t1 || !player().packets[player().currentIndex]) { resolve(); return; }
+                        if (!state.pausedHidden && performance.now() - state.lastFrameAt > 800) {
+                            // no frames are being drawn (window hidden / minimised): hold the clip until they return
+                            state.pausedHidden = true;
+                            try { pauseUI(); } catch (e) { /* ignore */ }
+                            setStatus('Paused — bring this window to the front to keep recording');
+                            log('no frames for 800 ms, pausing the clip');
+                        }
+                        let done = false;
+                        requestAnimationFrame(() => { if (!done) { done = true; tick(); } });
+                        setTimeout(() => { if (!done) { done = true; tick(); } }, 120);
+                    };
+                    tick();
                 });
                 pauseUI();
-                await frames(1);
-                recorder.pause();
+                state.transition = true;
+                const real = (performance.now() - tStart) / 1000;
+                clipReport.push({ cap: cap.index, name: cap.name, seconds: real, frames: state.framesClip });
+                log(`  clip done: replay time ${(nowMs() / 1000).toFixed(2)}s after ${real.toFixed(1)}s real time, ${state.framesClip} frames captured, ${chunks.length} chunks so far`);
+                await frames(2);
             }
         } catch (e) {
-            console.error('[CapReel]', e); setStatus('Error: ' + e.message);
+            console.error('[CapReel]', e);
+            setStatus('Error: ' + e.message);
         }
-        if (started) { recorder.stop(); await stopped; }
-        state.recording = false; state.cap = null; state.clip = null;
+        state.followPid = null;
+        document.removeEventListener('visibilitychange', onVisibility);
+        if (started) { try { recorder.stop(); await stopped; } catch (e) { log('stop failed', e); } }
+        state.recording = false; state.transition = false; state.cap = null; state.clip = null;
         exitRecordMode();
+        const wall = (performance.now() - tRec0) / 1000;
+        log('summary: ' + clipReport.map((c) => `#${c.cap} ${c.name} ${c.seconds.toFixed(1)}s/${c.frames}f`).join(', ') + ` | total ${wall.toFixed(1)}s wall, ${state.framesTotal} frames, ${chunks.length} chunks`);
         if (chunks.length) {
             const blob = new Blob(chunks, { type: mime.split(';')[0] });
             const ext = mime.startsWith('video/mp4') ? 'mp4' : 'webm';
             const meta = (tagpro.replayData.packets.find((p) => p[1] === 'recorder-metadata') || [])[2] || {};
             const name = `${meta.mapName || 'tagpro'}-${meta.gameId || 'replay'}-caps.${ext}`;
             download(blob, name);
-            setStatus(`Saved ${name} (${(blob.size / 1e6).toFixed(1)} MB)`);
-        } else {
+            log('saved ' + name + ' ' + blob.size + ' bytes, type ' + blob.type + ', chunks ' + chunks.length + ', first chunk ' + (chunks[0] ? chunks[0].size : 0) + ' bytes');
+            const bad = clipReport.filter((c) => c.frames < c.seconds * 10);
+            setStatus(`Saved ${name} (${(blob.size / 1e6).toFixed(1)} MB, ${clipReport.length} clips, ~${Math.round(wall)} s). Frames per clip: ${clipReport.map((c) => c.frames).join(', ')}` +
+                (state.abort ? ' — stopped early' : '') + (bad.length ? ` — WARNING: too few frames for cap ${bad.map((c) => c.cap).join(', ')}` : '') + ' — use "Copy diagnostics" if anything is missing.');
+            state.lastBlob = blob;
+        } else if (!state.status.startsWith('Error')) {
             setStatus(state.abort ? 'Stopped.' : 'Nothing recorded — was the tab visible?');
         }
-        state.lastBlob = chunks.length ? new Blob(chunks, { type: mime.split(';')[0] }) : null;
     }
     function download(blob, name) {
         const a = document.createElement('a');
@@ -337,20 +536,21 @@
         let dur = 0;
         for (const h of header) {
             const copy = JSON.parse(JSON.stringify(h)); copy[0] = 0;
-            if (copy[1] === 'recorder-metadata') copy[2].capsOnly = true;
+            if (copy[1] === 'recorder-metadata') { copy[2].capsOnly = true; delete copy[2].follow; }   // `follow` makes the viewer auto-seek to that player's first cap
             out.push(copy);
         }
         // merge overlapping windows into stretches, remembering where each cap's lead-in starts
         const wins = caps.map((c) => Object.assign({ cap: c }, clipWindow(c))).sort((a, b) => a.t0 - b.t0);
-        // Overlapping windows: if the next run starts after the previous cap, keep one continuous
-        // stretch and switch the camera only after that cap has been seen (hold up to `post`
-        // seconds, but move on by the time the next capper grabs). If the runs truly overlap
-        // (next grab before the previous cap), rewind and show the next run from its own lead-in.
+        // Overlapping windows are kept in ONE continuous stretch (a rewind in a replay looks broken:
+        // players teleport, the previous cap happens twice, clock and score jump back). The camera
+        // switches to the next capper once the previous cap has been seen: hold up to `post` seconds,
+        // but move on by the time the next capper grabs, and at least 0.8 s after the cap (if the
+        // next run already started before the previous cap, we simply miss its first moments).
         const stretches = [];
         for (const w of wins) {
             const c = w.cap;
             const last = stretches[stretches.length - 1];
-            if (last && w.t0 <= last.t1 && c.grab >= last.caps[last.caps.length - 1].t + 300) {
+            if (last && w.t0 <= last.t1) {
                 const prev = last.caps[last.caps.length - 1];
                 const hold = Math.min(Math.max(c.grab - prev.t, 800), CFG.post * 1000);
                 const sw = Math.max(w.t0, Math.min(prev.t + hold, c.t - 300));
@@ -441,7 +641,7 @@
 
     // ------------------------------------------------------------------ UI
     let statusEl = null;
-    function setStatus(s) { state.status = s; if (statusEl) statusEl.textContent = s; console.log('[CapReel] ' + s); }
+    function setStatus(s) { state.status = s; if (statusEl) statusEl.textContent = s; log('status: ' + s); }
     function buildPanel(caps) {
         const css = document.createElement('style');
         css.textContent = `
@@ -475,29 +675,39 @@
               <div class="row"><label><input id="tpcrHud" type="checkbox"> hide score / timer</label></div>
               <div class="row"><label><input id="tpcrBanners" type="checkbox"> cap banners</label></div>
               <div class="row"><label><input id="tpcrFades" type="checkbox"> fades between clips</label></div>
+              <div class="row"><label><input id="tpcrWebm" type="checkbox"> record as WebM instead of MP4</label></div>
+              <div class="row"><label><input id="tpcrLock" type="checkbox"> caps-only playback: lock the view</label></div>
+              <div class="row"><label title="When the caps-only replay reaches its end, hold the last frame for this many seconds, then play the whole reel again"><input id="tpcrLoop" type="checkbox"> caps-only playback: replay automatically (hold last frame, s)</label><input id="tpcrLoopDelay" type="number" min="0" max="60" step="0.5" title="seconds the last frame stays on screen before the reel starts over"></div>
               <button id="tpcrRecord">Record cap reel (1080p60)</button>
               <button id="tpcrStop" class="stop" style="display:none">Stop</button>
               <button id="tpcrSave" class="secondary">Save caps-only replay (.ndjson)</button>
               <button id="tpcrOpen" class="secondary">Open caps-only replay</button>
+              <button id="tpcrDiag" class="secondary">Copy diagnostics</button>
               <div class="status" id="tpcrStatus"></div>
             </div>`;
         document.body.appendChild(el);
         statusEl = el.querySelector('#tpcrStatus');
         const q = (s) => el.querySelector(s);
         q('#tpcrMode').value = CFG.mode; q('#tpcrBefore').value = CFG.before; q('#tpcrPre').value = CFG.pre; q('#tpcrPost').value = CFG.post;
-        q('#tpcrZoom').value = CFG.zoom; q('#tpcrHud').checked = CFG.hideHud; q('#tpcrBanners').checked = CFG.banners; q('#tpcrFades').checked = CFG.fades;
+        q('#tpcrZoom').value = CFG.zoom; q('#tpcrHud').checked = CFG.hideHud; q('#tpcrBanners').checked = CFG.banners; q('#tpcrFades').checked = CFG.fades; q('#tpcrWebm').checked = !!CFG.webm; q('#tpcrLock').checked = CFG.lockView !== false;
+        q('#tpcrLoop').checked = CFG.loop !== false; q('#tpcrLoopDelay').value = CFG.loopDelay;
         const read = () => {
             CFG.mode = q('#tpcrMode').value; CFG.before = +q('#tpcrBefore').value || 8; CFG.pre = +q('#tpcrPre').value || 0; CFG.post = +q('#tpcrPost').value || 0;
-            CFG.zoom = Math.min(2, Math.max(0.5, +q('#tpcrZoom').value || 1)); CFG.hideHud = q('#tpcrHud').checked; CFG.banners = q('#tpcrBanners').checked; CFG.fades = q('#tpcrFades').checked;
+            CFG.zoom = Math.min(2, Math.max(0.5, +q('#tpcrZoom').value || 1)); CFG.hideHud = q('#tpcrHud').checked; CFG.banners = q('#tpcrBanners').checked; CFG.fades = q('#tpcrFades').checked; CFG.webm = q('#tpcrWebm').checked; CFG.lockView = q('#tpcrLock').checked; if (viewLocked) tagpro.renderer.forceZoomUpdate = true;
+            const wasLoop = CFG.loop;
+            CFG.loop = q('#tpcrLoop').checked; CFG.loopDelay = Math.min(60, Math.max(0, +q('#tpcrLoopDelay').value || 0));
+            if (CFG.loop && !wasLoop && viewLocked && atEnd() && !state.recording) restartReel();   // switched on after the reel had already finished
+            if (!CFG.loop) { clearTimeout(loopTimer); state.restarting = false; }                  // a pending restart is dropped
             saveCfg();
         };
-        el.addEventListener('change', read);
+        el.addEventListener('change', (ev) => { read(); if (ev.target && ev.target.blur) ev.target.blur(); });
+        el.addEventListener('keydown', (ev) => { if ((ev.key === 'Escape' || ev.key === 'Enter') && ev.target && ev.target.blur) ev.target.blur(); });
         q('h4 span').onclick = () => el.classList.toggle('collapsed');
         q('#tpcrRecord').onclick = async () => {
             read();
             if (!caps.length) return;
             const total = caps.reduce((s, c) => { const w = clipWindow(c); return s + (w.t1 - w.t0); }, 0) / 1000;
-            setStatus(`Recording ~${Math.round(total)} s of clips in real time — keep this tab visible.`);
+            setStatus(`Recording ~${Math.round(total)} s of clips in real time — keep this window in front; it pauses itself if you switch away.`);
             el.querySelectorAll('input,select').forEach((i) => { i.disabled = true; });
             q('#tpcrRecord').disabled = true; q('#tpcrStop').style.display = '';
             await recordReel(caps);
@@ -507,6 +717,14 @@
         q('#tpcrStop').onclick = () => { state.abort = true; };
         q('#tpcrSave').onclick = () => { read(); saveCapsOnly(caps); };
         q('#tpcrOpen').onclick = () => { read(); openCapsOnly(caps); };
+        q('#tpcrDiag').onclick = async () => {
+            const meta = (tagpro.replayData.packets.find((p) => p[1] === 'recorder-metadata') || [])[2] || {};
+            const head = [`TagPro Cap Reel ${VERSION} — ${navigator.userAgent}`, `replay ${meta.mapName || ''} ${meta.gameId || ''}, ${caps.length} caps, window ${window.innerWidth}x${window.innerHeight}, replaySpeed ${tagpro.replaySpeed}, state ${tagpro.state}`,
+                `settings ${JSON.stringify(CFG)}`, `caps ${caps.map((c) => `${c.index}:${c.name}@${c.grab}-${c.t}`).join(' ')}`];
+            const text = head.concat(diag).join('\n');
+            try { await navigator.clipboard.writeText(text); setStatus('Diagnostics copied — paste them into the chat.'); }
+            catch (e) { console.log(text); setStatus('Could not copy; the diagnostics were printed to the console instead.'); }
+        };
         if (!pickMime()) { q('#tpcrRecord').disabled = true; setStatus('Video recording is not supported in this browser; the caps-only replay still works.'); }
     }
 
@@ -518,13 +736,25 @@
             buildPanel(caps);
             const meta = (tagpro.replayData.packets.find((p) => p[1] === 'recorder-metadata') || [])[2] || {};
             if (meta.capsOnly) {
-                // a caps-only file: follow whoever the file says, hide the HUD if wanted
-                const vp = tagpro.viewport; vp.overview = false; vp.centerLock = false; vp.followPlayer = true; vp.pan = false; vp.panning = false; vp.newTarget = false;
-                tagpro.zoom = CFG.zoom; tagpro.renderer.forceZoomUpdate = true;
+                // a caps-only file: the id packets switch the camera; keep the view steady, hide the HUD if wanted
+                enterViewMode();
                 if (CFG.hideHud) tagpro.renderer.layers.ui.visible = false;
-                setStatus('Caps-only replay: camera follows each capper automatically.');
+                // Older caps-only files still carry `follow`, which makes the viewer jump to that player's
+                // first cap on load (skipping every cap before it). Put it back at the start.
+                const fixStart = () => {
+                    const p = tagpro.replayPlayer && tagpro.replayPlayer.player;
+                    if (meta.follow && p && p.currentTime > 1500 && !state.recording) {
+                        log('undoing the viewer\'s auto-seek to the followed player (replay time ' + (p.currentTime / 1000).toFixed(1) + 's)');
+                        seekPaused(tagpro.replayData.minTS || 0);
+                        playUI();
+                    }
+                };
+                fixStart(); setTimeout(fixStart, 1500); setTimeout(fixStart, 4000);
+                installLoop();
+                if (CFG.loop && atEnd()) restartReel();   // the script came up after the replay had already run out
+                setStatus('Caps-only replay: camera follows each capper automatically' + (CFG.loop ? ', plays again when it ends' : '') + (meta.follow ? ' (re-save this file from the original replay to get rid of the start-up jump)' : '') + '.');
             }
-            window.tpCapReel = { CFG, findCaps, recordReel, buildCapsOnlyReplay, saveCapsOnly, openCapsOnly, state, follow, seekPaused, playUI, pauseUI, enterRecordMode, exitRecordMode, clipWindow };
+            window.tpCapReel = { CFG, findCaps, recordReel, buildCapsOnlyReplay, saveCapsOnly, openCapsOnly, state, follow, seekTo, seekPaused, playUI, pauseUI, enterRecordMode, exitRecordMode, clipWindow, installLoop, restartReel, atEnd };
         })
         .catch((e) => console.warn('[CapReel] not initialised:', e));
 })();
