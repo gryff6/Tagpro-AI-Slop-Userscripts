@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         TagPro Pro Scoreboard
 // @namespace    https://tagpro.koalabeast.com/
-// @version      2.4.0
+// @version      2.4.1
 // @description  Adds a broadcast-style scoreboard/HUD overlay to TagPro. Hides the native TagPro score/clock/map HUD and replaces it with a compact, moveable one.
-// @author       Claude Fable 5.1, gryff6
+// @author       you
 // @match        https://tagpro.koalabeast.com/*
 // @match        https://*.koalabeast.com/*
 // @run-at       document-idle
@@ -815,13 +815,13 @@
   const settingsBtn = document.createElement('button');
   settingsBtn.id = 'tp-settings-btn';
   settingsBtn.textContent = 'SCOREBOARD ⚙';
-  settingsBtn.title = 'TagPro Pro Scoreboard v2.4.0';
+  settingsBtn.title = 'TagPro Pro Scoreboard v2.4.1';
   document.body.appendChild(settingsBtn);
 
   const panel = document.createElement('div');
   panel.id = 'tp-settings-panel';
   panel.innerHTML = `
-    <div class="tp-hint" style="margin:0 0 8px;">TagPro Pro Scoreboard <b>v2.4.0</b> — if this number doesn't match the file you just installed, the browser is still running an older copy.</div>
+    <div class="tp-hint" style="margin:0 0 8px;">TagPro Pro Scoreboard <b>v2.4.1</b> — if this number doesn't match the file you just installed, the browser is still running an older copy.</div>
     <div class="tp-row2">
       <span>Show series section</span>
       <input type="checkbox" id="tp-in-show-series">
@@ -1407,6 +1407,7 @@
   }
 
   let lastRed = null, lastBlue = null;
+  let otSeenAt = 0; // when we first observed overtime/clutch (fallback clock origin)
   function bump(el) {
     el.classList.remove('tp-bump');
     void el.offsetWidth; // restart animation
@@ -1683,6 +1684,7 @@
     const subEl = document.getElementById('tp-substate');
     const states = tp.states || {};
     const remaining = (tp.gameEndsAt || 0) - Date.now();
+    if (tp.state !== states.OVERTIME && tp.state !== states.CLUTCH) otSeenAt = 0;
     if (tp.state === states.COUNTDOWN) {
       clockEl.textContent = formatClock(remaining);
       subEl.textContent = 'STARTING';
@@ -1693,7 +1695,14 @@
       // Regulation is over, so gameEndsAt is in the past and "remaining"
       // is negative — count UP from the moment regulation ended, like the
       // native clock does, instead of pinning at 0:00.
-      clockEl.textContent = formatClock(remaining < 0 ? -remaining : remaining);
+      // If we joined mid-overtime the server never sent us an end time
+      // (gameEndsAt is 0/undefined, which would make "elapsed" read as the
+      // whole Unix epoch), so in that case count from when we first saw
+      // overtime instead.
+      const endsAtUsable = tp.gameEndsAt > 0 && (Date.now() - tp.gameEndsAt) < 6 * 3600 * 1000;
+      if (!otSeenAt) otSeenAt = Date.now();
+      const elapsed = endsAtUsable ? Math.max(0, -remaining) : (Date.now() - otSeenAt);
+      clockEl.textContent = formatClock(elapsed);
       subEl.textContent = tp.state === states.OVERTIME ? 'OVERTIME' : 'CLUTCH';
     } else {
       clockEl.textContent = formatClock(remaining);
