@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         TagPro Custom Background
-// @namespace    tagpro-custom-background
+// @namespace    https://tagpro.koalabeast.com/
 // @author       Claude Fable 5.1, gryff6
 // @version      4.3.0
 // @description  Pick a picture or video from your computer and use it as the TagPro map background.
