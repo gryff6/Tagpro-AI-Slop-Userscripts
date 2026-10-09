@@ -42,9 +42,10 @@
 
     document.head.insertAdjacentHTML('beforeend', `<style>
       .tplb, #tplb-btn, #tplb-menu { font-family: 'Rajdhani', sans-serif; }
-      .tplb{position:fixed;z-index:9999;min-width:110px;min-height:56px;overflow:hidden;resize:both;
+      .tplb{position:fixed;z-index:9999;min-width:110px;min-height:56px;overflow:hidden;
         background:linear-gradient(180deg,rgba(12,13,16,.94),rgba(8,9,11,.94));color:#e8eaee;
         border-radius:4px;box-shadow:0 6px 16px rgba(0,0,0,.5);user-select:none}
+      .tplb-rz{position:absolute;right:0;bottom:0;width:16px;height:16px;cursor:nwse-resize}
       .tplb-h{cursor:move;display:flex;justify-content:space-between;align-items:baseline;gap:.5em;
         padding:.25em .6em;border-bottom:1px solid rgba(255,255,255,.08)}
       .tplb-t{font-family:'Teko',sans-serif;font-weight:600;font-size:1.25em;letter-spacing:.06em;
@@ -103,7 +104,18 @@
       const i = Object.keys(panels).length;
       Object.assign(el.style, { left: (saved.x ?? 10 + i * 30) + 'px', top: (saved.y ?? 80 + i * 30) + 'px',
         width: saved.w || '190px', height: saved.h || '' });
-      el.innerHTML = `<div class="tplb-h"><span class="tplb-t">${STATS[k]}</span><span class="tplb-top"></span></div><div class="tplb-b"></div>`;
+      el.innerHTML = `<div class="tplb-h"><span class="tplb-t">${STATS[k]}</span><span class="tplb-top"></span></div><div class="tplb-b"></div><div class="tplb-rz"></div>`;
+      // invisible corner handle: drag to resize
+      el.lastChild.onpointerdown = e => {
+        e.preventDefault();
+        const x = e.clientX, y = e.clientY, w = el.offsetWidth, h = el.offsetHeight;
+        const move = m => {
+          el.style.width = Math.max(110, w + m.clientX - x) + 'px';
+          el.style.height = Math.max(56, h + m.clientY - y) + 'px';
+        };
+        document.addEventListener('pointermove', move);
+        document.addEventListener('pointerup', () => document.removeEventListener('pointermove', move), { once: true });
+      };
       // drag by header
       el.firstChild.onpointerdown = e => {
         const dx = e.clientX - el.offsetLeft, dy = e.clientY - el.offsetTop;
@@ -130,7 +142,7 @@
         const el = panel(k);
         el.style.display = '';
         el.querySelector('.tplb-top').textContent = 'Top ' + cfg.n;
-        const body = el.lastChild;
+        const body = el.querySelector('.tplb-b');
         const rows = el._rows ||= new Map(); // player id -> row element, reused so it can slide
 
         // FLIP: note where each row is now, reorder, then animate from old spot to new
