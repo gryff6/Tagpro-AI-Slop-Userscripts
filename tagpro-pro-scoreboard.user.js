@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TagPro Pro Scoreboard
 // @namespace    https://tagpro.koalabeast.com/
-// @version      2.4.1
+// @version      2.4.2
 // @description  Adds a broadcast-style scoreboard/HUD overlay to TagPro. Hides the native TagPro score/clock/map HUD and replaces it with a compact, moveable one.
 // @author       you
 // @match        https://tagpro.koalabeast.com/*
@@ -619,9 +619,11 @@
     .tp-row.tp-team-total.tp-team-2 { background: rgba(74,157,255,.12); border-top: 1px solid rgba(74,157,255,.3); }
     .tp-row.tp-team-total .tp-nm { text-transform: uppercase; letter-spacing: .03em; font-size: 9px; color: rgba(255,255,255,.85); }
     .tp-row.tp-team-total span { font-size: 9.5px; }
-    .tp-pname { display: flex; align-items: center; gap: 4px; overflow: hidden; min-width: 0; text-align: left !important; }
+    /* No overflow:hidden here — it clipped the flag dot's glow on the left.
+       The name span does its own ellipsis truncation. */
+    .tp-pname { display: flex; align-items: center; gap: 4px; min-width: 0; text-align: left !important; }
     .tp-pname span.tp-nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1 1 auto; }
-    .tp-flagdot { width: 6px; height: 6px; border-radius: 50%; flex: 0 0 auto; box-shadow: 0 0 5px 1px currentColor; }
+    .tp-flagdot { width: 6px; height: 6px; border-radius: 50%; flex: 0 0 auto; margin-left: 2px; box-shadow: 0 0 5px 1px currentColor; }
     .tp-team-divider { height: 5px; background: rgba(255,255,255,.03); }
 
     /* ---- settings toggle ---- */
@@ -815,13 +817,13 @@
   const settingsBtn = document.createElement('button');
   settingsBtn.id = 'tp-settings-btn';
   settingsBtn.textContent = 'SCOREBOARD ⚙';
-  settingsBtn.title = 'TagPro Pro Scoreboard v2.4.1';
+  settingsBtn.title = 'TagPro Pro Scoreboard v2.4.2';
   document.body.appendChild(settingsBtn);
 
   const panel = document.createElement('div');
   panel.id = 'tp-settings-panel';
   panel.innerHTML = `
-    <div class="tp-hint" style="margin:0 0 8px;">TagPro Pro Scoreboard <b>v2.4.1</b> — if this number doesn't match the file you just installed, the browser is still running an older copy.</div>
+    <div class="tp-hint" style="margin:0 0 8px;">TagPro Pro Scoreboard <b>v2.4.2</b> — if this number doesn't match the file you just installed, the browser is still running an older copy.</div>
     <div class="tp-row2">
       <span>Show series section</span>
       <input type="checkbox" id="tp-in-show-series">

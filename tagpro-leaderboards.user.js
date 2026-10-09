@@ -50,7 +50,7 @@
       .tplb-t{font-family:'Teko',sans-serif;font-weight:600;font-size:1.25em;letter-spacing:.06em;
         text-transform:uppercase;color:#eef1f5;line-height:1.1;white-space:nowrap}
       .tplb-top{font-size:.65em;letter-spacing:.14em;text-transform:uppercase;color:rgba(255,255,255,.4);white-space:nowrap}
-      .tplb-r{display:flex;align-items:center;gap:.5em;padding:.18em .6em;font-weight:600;
+      .tplb-r{position:relative;background:#0c0d10;display:flex;align-items:center;gap:.5em;padding:.18em .6em;font-weight:600;
         border-left:3px solid transparent;border-bottom:1px solid rgba(255,255,255,.035)}
       .tplb-r.tplb-red{border-left-color:#ff4655}
       .tplb-r.tplb-blue{border-left-color:#4a9dff}
@@ -124,17 +124,44 @@
     });
 
     function render() {
-      const players = Object.values(tagpro.players);
+      const players = Object.entries(tagpro.players);
       for (const k of Object.keys(STATS)) {
         if (!cfg.on.includes(k)) { if (panels[k]) panels[k].style.display = 'none'; continue; }
         const el = panel(k);
         el.style.display = '';
         el.querySelector('.tplb-top').textContent = 'Top ' + cfg.n;
-        el.lastChild.innerHTML = players
-          .sort((a, b) => val(b, k) - val(a, k)).slice(0, cfg.n)
-          .map((p, i) => `<div class="tplb-r ${p.team === 1 ? 'tplb-red' : 'tplb-blue'} ${i === 0 && val(p, k) > 0 ? 'tplb-lead' : ''}">
-            <span class="tplb-rk">${i + 1}</span><span class="tplb-nm">${esc(p.name)}</span>
-            <span class="tplb-v">${k === 'kd' ? val(p, k).toFixed(2) : val(p, k)}</span></div>`).join('');
+        const body = el.lastChild;
+        const rows = el._rows ||= new Map(); // player id -> row element, reused so it can slide
+
+        // FLIP: note where each row is now, reorder, then animate from old spot to new
+        const before = new Map([...rows].map(([id, r]) => [id, r.getBoundingClientRect().top]));
+        const top = players.sort((a, b) => val(b[1], k) - val(a[1], k)).slice(0, cfg.n);
+        const keep = new Set(top.map(([id]) => id));
+        for (const [id, r] of rows) if (!keep.has(id)) { r.remove(); rows.delete(id); }
+        top.forEach(([id, p], i) => {
+          let r = rows.get(id);
+          if (!r) {
+            r = document.createElement('div');
+            r.innerHTML = '<span class="tplb-rk"></span><span class="tplb-nm"></span><span class="tplb-v"></span>';
+            rows.set(id, r);
+          }
+          r.className = `tplb-r ${p.team === 1 ? 'tplb-red' : 'tplb-blue'} ${i === 0 && val(p, k) > 0 ? 'tplb-lead' : ''}`;
+          const [rk, nm, v] = r.children;
+          rk.textContent = i + 1;
+          nm.textContent = p.name;
+          v.textContent = k === 'kd' ? val(p, k).toFixed(2) : val(p, k);
+          if (body.children[i] !== r) body.insertBefore(r, body.children[i] || null);
+        });
+        for (const [id, r] of rows) {
+          const dy = before.has(id) ? before.get(id) - r.getBoundingClientRect().top : 0;
+          if (!dy) continue;
+          r.style.transition = 'none';
+          r.style.transform = `translateY(${dy}px)`;
+          r.style.zIndex = 1;
+          r.offsetWidth; // force reflow so the transition starts from the old spot
+          r.style.transition = 'transform .35s ease';
+          r.style.transform = '';
+        }
       }
     }
     setInterval(render, 500);
