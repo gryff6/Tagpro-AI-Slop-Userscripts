@@ -591,7 +591,7 @@
     }
     .tp-roster-header span { text-align: center; }
     .tp-roster-header span:first-child { text-align: left; }
-    .tp-row.tp-stat-row {
+    .tp-row.tp-stat-row { position: relative; background: #0c0d10;
       padding: 1.5px 6px;
       font-size: 10px;
       font-weight: 600;
@@ -1452,10 +1452,11 @@
         const cls = isLeader ? ` class="tp-stat-lead tp-lead-${p.team}"` : '';
         return `<span${cls}>${formatStatVal(c, val)}</span>`;
       }).join('');
-      return `<div class="tp-row tp-stat-row ${teamClass} ${p.dead ? 'tp-dead' : ''} ${fc ? 'tp-carrier' : ''}">
-        <span class="tp-pname"><span class="tp-flagdot" ${dotStyle}></span><span class="tp-nm">${escapeHtml(p.name || '')}</span></span>
-        ${cells}
-      </div>`;
+      return {
+        key: 'p' + (p.id ?? p.name),
+        cls: `tp-row tp-stat-row ${teamClass} ${p.dead ? 'tp-dead' : ''} ${fc ? 'tp-carrier' : ''}`,
+        inner: `<span class="tp-pname"><span class="tp-flagdot" ${dotStyle}></span><span class="tp-nm">${escapeHtml(p.name || '')}</span></span>${cells}`,
+      };
     };
 
     // Cumulative per-team totals, one column sum at a time. The team with
@@ -1489,20 +1490,48 @@
         return `<span${cls}>${formatStatVal(c, val)}</span>`;
       }).join('');
       const label = (teamName || (teamNum === 1 ? 'RED' : 'BLUE')).toUpperCase();
-      return `<div class="tp-row tp-stat-row tp-team-total tp-team-${teamNum}">
-        <span class="tp-pname"><span class="tp-nm">${escapeHtml(label)}</span></span>
-        ${cells}
-      </div>`;
+      return {
+        key: 'tot' + teamNum,
+        cls: `tp-row tp-stat-row tp-team-total tp-team-${teamNum}`,
+        inner: `<span class="tp-pname"><span class="tp-nm">${escapeHtml(label)}</span></span>${cells}`,
+      };
     };
 
-    const html =
-      teams[1].map((p) => renderRow(p, 'tp-team-1')).join('') +
-      renderTotalRow(1, redName) +
-      '<div class="tp-team-divider"></div>' +
-      teams[2].map((p) => renderRow(p, 'tp-team-2')).join('') +
-      renderTotalRow(2, blueName);
+    const list = [
+      ...teams[1].map((p) => renderRow(p, 'tp-team-1')),
+      renderTotalRow(1, redName),
+      { key: 'divider', cls: 'tp-team-divider', inner: '' },
+      ...teams[2].map((p) => renderRow(p, 'tp-team-2')),
+      renderTotalRow(2, blueName),
+    ];
 
-    document.getElementById('tp-roster-body').innerHTML = html;
+    // Rows are kept per player and reused, so when the order changes the
+    // row slides to its new spot (FLIP) instead of being rebuilt in place.
+    const body = document.getElementById('tp-roster-body');
+    const rows = (renderRoster.rows ||= new Map());
+    const before = new Map([...rows].map(([k, el]) => [k, el.getBoundingClientRect().top]));
+    const keep = new Set(list.map((r) => r.key));
+    for (const [k, el] of rows) if (!keep.has(k)) { el.remove(); rows.delete(k); }
+    list.forEach((r, i) => {
+      let el = rows.get(r.key);
+      if (!el) { el = document.createElement('div'); rows.set(r.key, el); }
+      if (el.className !== r.cls) el.className = r.cls;
+      if (el._inner !== r.inner) { el.innerHTML = r.inner; el._inner = r.inner; }
+      if (body.children[i] !== el) body.insertBefore(el, body.children[i] || null);
+    });
+    for (const [k, el] of rows) {
+      const dy = before.has(k) ? before.get(k) - el.getBoundingClientRect().top : 0;
+      // Divide by the panel's current scale: getBoundingClientRect is in
+      // screen pixels but translateY applies inside the scaled panel.
+      const s = roster.getBoundingClientRect().width / roster.offsetWidth || 1;
+      if (Math.abs(dy) < 1 || k === 'divider') continue;
+      el.style.transition = 'none';
+      el.style.transform = `translateY(${dy / s}px)`;
+      el.style.zIndex = 1;
+      el.offsetWidth; // force reflow so the slide starts from the old spot
+      el.style.transition = 'transform .8s ease';
+      el.style.transform = '';
+    }
   }
 
   // ---------------------------------------------------------------------
