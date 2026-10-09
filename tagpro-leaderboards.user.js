@@ -159,7 +159,7 @@
           r.style.transform = `translateY(${dy}px)`;
           r.style.zIndex = 1;
           r.offsetWidth; // force reflow so the transition starts from the old spot
-          r.style.transition = 'transform .35s ease';
+          r.style.transition = 'transform .8s ease';
           r.style.transform = '';
         }
       }
