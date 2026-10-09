@@ -366,12 +366,12 @@
       width: max-content;
       transition: top .38s cubic-bezier(.2,.8,.2,1);
       filter: drop-shadow(0 8px 20px rgba(0,0,0,.6));
-      padding: 6px 28px 8px;
+      padding: 8px 52px 10px;
       text-align: center;
       background: linear-gradient(180deg, rgba(20,22,28,.96), rgba(8,9,11,.96));
       border: 1px solid rgba(255,255,255,.12);
       border-top: 2px solid var(--tp-win, #ffd23b);
-      clip-path: polygon(10px 0, calc(100% - 10px) 0, 100% 100%, 0 100%);
+      clip-path: polygon(24px 0, calc(100% - 24px) 0, 100% 50%, calc(100% - 24px) 100%, 24px 100%, 0 50%); /* hexagon */
       animation: tp-winner-in .55s cubic-bezier(.2,.8,.2,1) both;
       will-change: transform, opacity;
     }
